@@ -2,16 +2,15 @@ import os
 import time
 import logging
 import hashlib
-import tempfile
-import email
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 import requests
 from bs4 import BeautifulSoup
 import PyPDF2
 from docx import Document as DocxDocument
+import email
+import io
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -24,6 +23,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableAssign, RunnableLambda
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,176 +40,101 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-# ----- Simple Vector Store -----
+# ----- Simple Vector Store (No ChromaDB) -----
 class SimpleVectorStore:
-    def __init__(self, embeddings_model):
-        self.embeddings_model = embeddings_model
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
         self.documents = []
-        self.embeddings = []
+        self.vectors = []
     
-    def add_documents(self, docs: List[Document]):
+    def add_documents(self, documents: List[Document]):
         """Add documents to the vector store"""
-        for doc in docs:
-            self.documents.append(doc)
+        for doc in documents:
             # Get embedding for the document
-            embedding = self.embeddings_model.embed_query(doc.page_content)
-            self.embeddings.append(embedding)
+            vector = self.embeddings.embed_query(doc.page_content)
+            self.documents.append(doc)
+            self.vectors.append(vector)
     
     def similarity_search(self, query: str, k: int = 5) -> List[Document]:
         """Search for similar documents"""
-        if not self.documents:
+        if not self.vectors:
             return []
         
         # Get query embedding
-        query_embedding = self.embeddings_model.embed_query(query)
+        query_vector = self.embeddings.embed_query(query)
         
         # Calculate similarities
-        similarities = cosine_similarity([query_embedding], self.embeddings)[0]
+        similarities = cosine_similarity([query_vector], self.vectors)[0]
         
         # Get top k indices
-        top_indices = np.argsort(similarities)[::-1][:k]
+        top_indices = np.argsort(similarities)[-k:][::-1]
         
         # Return top documents
-        return [self.documents[i] for i in top_indices]
+        return [self.documents[i] for i in top_indices if i < len(self.documents)]
 
 # ----- Multi-format Document Loader -----
-def get_file_extension(url: str) -> str:
-    """Extract file extension from URL"""
-    parsed_url = urlparse(url)
-    path = parsed_url.path.lower()
-    if path.endswith('.pdf'):
-        return 'pdf'
-    elif path.endswith('.docx'):
-        return 'docx'
-    elif path.endswith('.eml'):
-        return 'eml'
-    else:
-        return 'html'  # Default to HTML
-
-def extract_text_from_pdf(file_content: bytes) -> str:
-    """Extract text from PDF file"""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-            temp_file.write(file_content)
-            temp_file.flush()
-            
-            text = ""
-            with open(temp_file.name, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
-            
-            os.unlink(temp_file.name)
-            return text.strip()
-    except Exception as e:
-        logger.error(f"Error extracting PDF text: {e}")
-        raise
-
-def extract_text_from_docx(file_content: bytes) -> str:
-    """Extract text from DOCX file"""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as temp_file:
-            temp_file.write(file_content)
-            temp_file.flush()
-            
-            doc = DocxDocument(temp_file.name)
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
-            
-            os.unlink(temp_file.name)
-            return text.strip()
-    except Exception as e:
-        logger.error(f"Error extracting DOCX text: {e}")
-        raise
-
-def extract_text_from_eml(file_content: bytes) -> str:
-    """Extract text from EML file"""
-    try:
-        msg = email.message_from_bytes(file_content)
-        text = ""
-        
-        # Extract subject
-        subject = msg.get('Subject', '')
-        if subject:
-            text += f"Subject: {subject}\n\n"
-        
-        # Extract body
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    text += part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                elif part.get_content_type() == "text/html":
-                    html_content = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    soup = BeautifulSoup(html_content, 'html.parser')
-                    text += soup.get_text()
-        else:
-            if msg.get_content_type() == "text/plain":
-                text += msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-            elif msg.get_content_type() == "text/html":
-                html_content = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                soup = BeautifulSoup(html_content, 'html.parser')
-                text += soup.get_text()
-        
-        return text.strip()
-    except Exception as e:
-        logger.error(f"Error extracting EML text: {e}")
-        raise
-
-def extract_text_from_html(file_content: bytes) -> str:
-    """Extract text from HTML content"""
-    try:
-        soup = BeautifulSoup(file_content, 'html.parser')
-        
-        # Remove script and style elements
-        for script in soup(["script", "style", "nav", "footer", "header"]):
-            script.decompose()
-        
-        # Extract text content
-        text = soup.get_text()
-        
-        # Clean up text
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = ' '.join(chunk for chunk in chunks if chunk)
-        text = ' '.join(text.split())
-        
-        return text
-    except Exception as e:
-        logger.error(f"Error extracting HTML text: {e}")
-        raise
-
 def load_document_content(url: str) -> List[Document]:
-    """Load and process document of various formats (PDF, DOCX, EML, HTML)"""
+    """Load content from various document formats"""
     try:
-        # Download the file
         response = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
-        file_content = response.content
-        file_extension = get_file_extension(url)
+        # Determine file type from URL or content type
+        url_lower = url.lower()
+        content_type = response.headers.get('content-type', '').lower()
         
-        logger.info(f"Processing {file_extension.upper()} file from {url}")
+        # Handle PDF files
+        if url_lower.endswith('.pdf') or 'pdf' in content_type:
+            pdf_file = io.BytesIO(response.content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
         
-        # Extract text based on file type
-        if file_extension == 'pdf':
-            text = extract_text_from_pdf(file_content)
-        elif file_extension == 'docx':
-            text = extract_text_from_docx(file_content)
-        elif file_extension == 'eml':
-            text = extract_text_from_eml(file_content)
-        else:  # HTML or unknown
-            text = extract_text_from_html(file_content)
+        # Handle DOCX files
+        elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
+            docx_file = io.BytesIO(response.content)
+            doc = DocxDocument(docx_file)
+            text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
         
-        if not text.strip():
-            raise ValueError(f"No text content extracted from {file_extension.upper()} file")
+        # Handle EML files
+        elif url_lower.endswith('.eml') or 'message/rfc822' in content_type:
+            eml_content = response.content.decode('utf-8', errors='ignore')
+            msg = email.message_from_string(eml_content)
+            
+            # Extract text content
+            text = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        text += part.get_payload(decode=True).decode('utf-8', errors='ignore')
+            else:
+                text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+            
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "eml"})]
         
-        logger.info(f"Successfully extracted {len(text)} characters from {file_extension.upper()} file")
-        
-        return [Document(page_content=text, metadata={"source": url, "file_type": file_extension})]
+        # Handle HTML/Text files (default)
+        else:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style", "nav", "footer", "header"]):
+                script.decompose()
+            
+            text = soup.get_text()
+            
+            # Clean up text
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = ' '.join(chunk for chunk in chunks if chunk)
+            text = ' '.join(text.split())
+            
+            return [Document(page_content=text, metadata={"source": url, "type": "html"})]
         
     except Exception as e:
-        logger.error(f"Failed to load document from {url}: {e}")
+        logger.error(f"Failed to load document {url}: {e}")
         raise
 
 # ----- Railway-Optimized RAG Engine -----
@@ -243,13 +168,23 @@ class RailwayRAGEngine:
             os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "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")
             os.environ["LANGCHAIN_PROJECT"] = "railway-rag-deployment"
 
-            # Initialize LLM and embeddings
+            # Initialize LLM and embeddings with proper arguments
             self.chat_model = ChatTogether(
+                together_api_key=os.environ["TOGETHER_API_KEY"],
                 model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
                 temperature=0,
                 max_tokens=3000
             )
-            self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
+            
+            self.embeddings = TogetherEmbeddings(
+                together_api_key=os.environ["TOGETHER_API_KEY"],
+                model="BAAI/bge-base-en-v1.5"
+            )
+
+            # Test embeddings initialization
+            logger.info("Testing embeddings...")
+            test_embedding = self.embeddings.embed_query("test")
+            logger.info(f"Embeddings working - dimension: {len(test_embedding)}")
 
             # Optimized text splitter
             self.text_splitter = RecursiveCharacterTextSplitter(
@@ -260,7 +195,7 @@ class RailwayRAGEngine:
 
             # Prompt template
             self.policy_prompt = ChatPromptTemplate([
-                ("system", """You are an expert document assistant. Answer questions concisely and accurately based on the provided document content.
+                ("system", """You are an expert document assistant. Answer questions concisely and accurately.
 
 CRITICAL FORMAT: Input questions are separated by " | ". Output answers MUST be separated by " | " in the same order.
 
@@ -280,6 +215,21 @@ Context: {context}"""),
         except Exception as e:
             logger.error(f"Failed to initialize RAG engine: {str(e)}")
             raise
+
+    def build_chain(self, retriever):
+        """Build Railway-optimized RAG chain"""
+        def retrieve(state):
+            query = state["query"]
+            results = retriever.similarity_search(query, k=5)
+            context = " ".join([doc.page_content for doc in results])
+            return context[:3000]
+        
+        return (
+            RunnableAssign({"context": RunnableLambda(retrieve)}) |
+            self.policy_prompt |
+            self.chat_model |
+            StrOutputParser()
+        )
 
     def _load_and_process_document(self, url: str) -> tuple:
         """Load and process document with multi-format support"""
@@ -310,23 +260,29 @@ Context: {context}"""),
             logger.error(f"Failed to load document {url}: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
 
-    def _create_vectorstore(self, chunks: List) -> SimpleVectorStore:
-        """Create simple vector store"""
-        logger.info("Creating simple vector store")
+    def _create_vectorstore(self, url: str, chunks: List) -> SimpleVectorStore:
+        """Create simple vectorstore"""
+        logger.info(f"Creating vectorstore for {url}")
         start_time = time.time()
         
         try:
             vectorstore = SimpleVectorStore(self.embeddings)
-            vectorstore.add_documents(chunks)
+            
+            # Add documents in batches
+            batch_size = 20
+            for i in range(0, len(chunks), batch_size):
+                batch = chunks[i:i + batch_size]
+                vectorstore.add_documents(batch)
+                logger.info(f"Processed batch {i//batch_size + 1}/{(len(chunks)-1)//batch_size + 1}")
             
             creation_time = time.time() - start_time
-            logger.info(f"Vector store created in {creation_time:.2f}s")
+            logger.info(f"Vectorstore created in {creation_time:.2f}s")
             
             return vectorstore
             
         except Exception as e:
-            logger.error(f"Vector store creation error: {e}")
-            raise HTTPException(status_code=500, detail="Failed to create vector store")
+            logger.error(f"Vectorstore creation error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to create vectorstore")
 
     def process_document_questions(self, url: str, questions: List[str]) -> List[str]:
         """Process document and answer questions"""
@@ -339,32 +295,24 @@ Context: {context}"""),
             # Load and process document
             docs, chunks = self._load_and_process_document(url)
             
-            # Create vector store
-            vectorstore = self._create_vectorstore(chunks)
+            # Create vectorstore
+            vectorstore = self._create_vectorstore(url, chunks)
+            
+            # Build chain
+            rag_chain = self.build_chain(vectorstore)
             
             # Process questions in batch
             logger.info(f"Processing {len(questions)} questions in batch...")
             batch_query = " | ".join(questions)
             
-            # Get relevant context
-            relevant_docs = vectorstore.similarity_search(batch_query, k=5)
-            context = " ".join([doc.page_content for doc in relevant_docs])[:3000]
-            
-            # Create prompt
-            prompt = self.policy_prompt.format(query=batch_query, context=context)
-            
-            # Get response from LLM
             query_start_time = time.time()
-            batch_result = self.chat_model.invoke(prompt)
+            batch_result = rag_chain.invoke({"query": batch_query})
             query_time = time.time() - query_start_time
             
             logger.info(f"LLM query completed in {query_time:.2f}s")
             
             # Parse results
-            if hasattr(batch_result, 'content'):
-                batch_result = batch_result.content
-            
-            answers = [answer.strip() for answer in str(batch_result).split(" | ")]
+            answers = [answer.strip() for answer in batch_result.split(" | ")]
             
             # Validate answer count
             if len(answers) != len(questions):
@@ -394,10 +342,10 @@ def verify_token(authorization: Optional[str] = Header(None)):
     if token != EXPECTED_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid Bearer token")
 
-# ----- Lifespan Context Manager -----
+# ----- Lifespan Management -----
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup and shutdown"""
+    """Manage application lifespan"""
     # Startup
     try:
         rag_engine.initialize()
@@ -409,12 +357,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
-    try:
-        # Clean up resources if needed
-        rag_engine.document_cache.clear()
-        logger.info("Application shutdown completed")
-    except Exception as e:
-        logger.error(f"Shutdown error: {str(e)}")
+    logger.info("Application shutting down...")
 
 # ----- FastAPI App -----
 app = FastAPI(title="Railway RAG API", version="1.0.0", lifespan=lifespan)
@@ -459,5 +402,5 @@ async def health_check():
 # Railway startup
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Railway sets PORT automatically
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
