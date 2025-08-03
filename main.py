@@ -153,6 +153,8 @@ class RailwayRAGEngine:
     def _get_url_hash(self, url: str) -> str:
         """Generate hash for URL for caching purposes"""
         return hashlib.md5(url.encode()).hexdigest()[:12]
+
+    
     
     def initialize(self):
         """Initialize RAG components for Railway environment"""
@@ -160,24 +162,23 @@ class RailwayRAGEngine:
             return
             
         logger.info("Initializing Railway RAG engine...")
-        
+
         try:
-            # Set environment variables
+            # Set environment variables FIRST
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             os.environ["LANGCHAIN_TRACING_V2"] = "true"
             os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "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")
             os.environ["LANGCHAIN_PROJECT"] = "railway-rag-deployment"
 
-            # Initialize LLM and embeddings with proper arguments
+            # Initialize LLM - NO together_api_key parameter
             self.chat_model = ChatTogether(
-                together_api_key=os.environ["TOGETHER_API_KEY"],
                 model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
                 temperature=0,
                 max_tokens=3000
             )
             
+            # Initialize embeddings - NO together_api_key parameter  
             self.embeddings = TogetherEmbeddings(
-                together_api_key=os.environ["TOGETHER_API_KEY"],
                 model="BAAI/bge-base-en-v1.5"
             )
 
@@ -186,7 +187,7 @@ class RailwayRAGEngine:
             test_embedding = self.embeddings.embed_query("test")
             logger.info(f"Embeddings working - dimension: {len(test_embedding)}")
 
-            # Optimized text splitter
+                # Optimized text splitter
             self.text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=600,
                 chunk_overlap=80,
@@ -197,21 +198,21 @@ class RailwayRAGEngine:
             self.policy_prompt = ChatPromptTemplate([
                 ("system", """You are an expert document assistant. Answer questions concisely and accurately.
 
-CRITICAL FORMAT: Input questions are separated by " | ". Output answers MUST be separated by " | " in the same order.
+    CRITICAL FORMAT: Input questions are separated by " | ". Output answers MUST be separated by " | " in the same order.
 
-Guidelines:
-- Direct, concise answers
-- Lead with key information
-- Cite specific document content when available
-- If unsure, state limitations clearly
-- Maintain exact order and use " | " separator between answers"""),
+    Guidelines:
+    - Direct, concise answers
+    - Lead with key information
+    - Cite specific document content when available
+    - If unsure, state limitations clearly
+    - Maintain exact order and use " | " separator between answers"""),
                 ("human", """Questions: {query}
-Context: {context}"""),
+    Context: {context}"""),
             ])
 
             self.initialized = True
             logger.info("Railway RAG engine initialized successfully")
-            
+                
         except Exception as e:
             logger.error(f"Failed to initialize RAG engine: {str(e)}")
             raise
