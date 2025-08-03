@@ -7,6 +7,7 @@ import email
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from urllib.parse import urlparse
+from contextlib import asynccontextmanager
 import requests
 from bs4 import BeautifulSoup
 import PyPDF2
@@ -205,38 +206,35 @@ class RailwayRAGEngine:
             
         logger.info("Initializing Railway RAG engine...")
         
-        # Set environment variables
-        os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
-        os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "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")
-        os.environ["LANGCHAIN_PROJECT"] = "railway-rag-deployment"
-
-        # Initialize LLM and embeddings
-        self.chat_model = ChatTogether(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-            temperature=0,
-            max_tokens=3000
-        )
-        self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
-
-        # Railway-friendly client with in-memory fallback
         try:
+            # Set environment variables
+            os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
+            os.environ["LANGCHAIN_TRACING_V2"] = "true"
+            os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "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")
+            os.environ["LANGCHAIN_PROJECT"] = "railway-rag-deployment"
+
+            # Initialize LLM and embeddings
+            self.chat_model = ChatTogether(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+                temperature=0,
+                max_tokens=3000
+            )
+            self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
+
+            # Railway-friendly client with in-memory fallback
             self.persistent_client = chromadb.Client()  # In-memory for Railway
             logger.info("Using in-memory ChromaDB client for Railway")
-        except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB: {e}")
-            raise
 
-        # Optimized text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=600,
-            chunk_overlap=80,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
+            # Optimized text splitter
+            self.text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=600,
+                chunk_overlap=80,
+                separators=["\n\n", "\n", ". ", " ", ""]
+            )
 
-        # Prompt template
-        self.policy_prompt = ChatPromptTemplate([
-            ("system", """You are an expert document assistant. Answer questions concisely and accurately based on the provided document content.
+            # Prompt template
+            self.policy_prompt = ChatPromptTemplate([
+                ("system", """You are an expert document assistant. Answer questions concisely and accurately based on the provided document content.
 
 CRITICAL FORMAT: Input questions are separated by " | ". Output answers MUST be separated by " | " in the same order.
 
@@ -246,12 +244,16 @@ Guidelines:
 - Cite specific document content when available
 - If unsure, state limitations clearly
 - Maintain exact order and use " | " separator between answers"""),
-            ("human", """Questions: {query}
+                ("human", """Questions: {query}
 Context: {context}"""),
-        ])
+            ])
 
-        self.initialized = True
-        logger.info("Railway RAG engine initialized successfully")
+            self.initialized = True
+            logger.info("Railway RAG engine initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG engine: {str(e)}")
+            raise
 
     def build_chain(self, retriever):
         """Build Railway-optimized RAG chain"""
@@ -391,18 +393,30 @@ def verify_token(authorization: Optional[str] = Header(None)):
     if token != EXPECTED_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid Bearer token")
 
-# ----- FastAPI App -----
-app = FastAPI(title="Railway RAG API", version="1.0.0")
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize RAG engine on startup"""
+# ----- Lifespan Context Manager -----
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown"""
+    # Startup
     try:
         rag_engine.initialize()
         logger.info("Railway application startup completed successfully")
     except Exception as e:
         logger.error(f"Startup error: {str(e)}")
         logger.info("Continuing with limited functionality...")
+    
+    yield
+    
+    # Shutdown
+    try:
+        # Clean up resources if needed
+        rag_engine.document_cache.clear()
+        logger.info("Application shutdown completed")
+    except Exception as e:
+        logger.error(f"Shutdown error: {str(e)}")
+
+# ----- FastAPI App -----
+app = FastAPI(title="Railway RAG API", version="1.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
@@ -444,5 +458,5 @@ async def health_check():
 # Railway startup
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8000))  # Railway sets PORT automatically
     uvicorn.run(app, host="0.0.0.0", port=port)
