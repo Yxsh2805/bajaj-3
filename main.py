@@ -12,6 +12,8 @@ import requests
 from bs4 import BeautifulSoup
 import PyPDF2
 from docx import Document as DocxDocument
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
@@ -22,9 +24,6 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableAssign, RunnableLambda
-import chromadb
-from langchain_chroma import Chroma
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +39,38 @@ class QuestionRequest(BaseModel):
 
 class AnswerResponse(BaseModel):
     answers: List[str]
+
+# ----- Simple Vector Store -----
+class SimpleVectorStore:
+    def __init__(self, embeddings_model):
+        self.embeddings_model = embeddings_model
+        self.documents = []
+        self.embeddings = []
+    
+    def add_documents(self, docs: List[Document]):
+        """Add documents to the vector store"""
+        for doc in docs:
+            self.documents.append(doc)
+            # Get embedding for the document
+            embedding = self.embeddings_model.embed_query(doc.page_content)
+            self.embeddings.append(embedding)
+    
+    def similarity_search(self, query: str, k: int = 5) -> List[Document]:
+        """Search for similar documents"""
+        if not self.documents:
+            return []
+        
+        # Get query embedding
+        query_embedding = self.embeddings_model.embed_query(query)
+        
+        # Calculate similarities
+        similarities = cosine_similarity([query_embedding], self.embeddings)[0]
+        
+        # Get top k indices
+        top_indices = np.argsort(similarities)[::-1][:k]
+        
+        # Return top documents
+        return [self.documents[i] for i in top_indices]
 
 # ----- Multi-format Document Loader -----
 def get_file_extension(url: str) -> str:
@@ -186,7 +217,6 @@ class RailwayRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
-        self.persistent_client = None
         self.text_splitter = None
         self.policy_prompt = None
         self.initialized = False
@@ -221,10 +251,6 @@ class RailwayRAGEngine:
             )
             self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
 
-            # Railway-friendly client with in-memory fallback
-            self.persistent_client = chromadb.Client()  # In-memory for Railway
-            logger.info("Using in-memory ChromaDB client for Railway")
-
             # Optimized text splitter
             self.text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=600,
@@ -255,21 +281,6 @@ Context: {context}"""),
             logger.error(f"Failed to initialize RAG engine: {str(e)}")
             raise
 
-    def build_chain(self, retriever):
-        """Build Railway-optimized RAG chain"""
-        def retrieve(state):
-            query = state["query"]
-            results = retriever.invoke(query, k=5)
-            context = " ".join([doc.page_content for doc in results])
-            return context[:3000]
-        
-        return (
-            RunnableAssign({"context": RunnableLambda(retrieve)}) |
-            self.policy_prompt |
-            self.chat_model |
-            StrOutputParser()
-        )
-
     def _load_and_process_document(self, url: str) -> tuple:
         """Load and process document with multi-format support"""
         if url in self.document_cache:
@@ -299,35 +310,23 @@ Context: {context}"""),
             logger.error(f"Failed to load document {url}: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
 
-    def _create_vectorstore(self, url: str, chunks: List) -> Any:
-        """Create in-memory vectorstore"""
-        url_hash = self._get_url_hash(url)
-        collection_name = f"doc_{url_hash}"
-        
-        logger.info(f"Creating vectorstore: {collection_name}")
+    def _create_vectorstore(self, chunks: List) -> SimpleVectorStore:
+        """Create simple vector store"""
+        logger.info("Creating simple vector store")
         start_time = time.time()
         
         try:
-            vectorstore = Chroma(
-                client=self.persistent_client,
-                collection_name=collection_name,
-                embedding_function=self.embeddings,
-            )
-            
-            # Add documents in batches
-            batch_size = 20
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i:i + batch_size]
-                vectorstore.add_documents(batch)
+            vectorstore = SimpleVectorStore(self.embeddings)
+            vectorstore.add_documents(chunks)
             
             creation_time = time.time() - start_time
-            logger.info(f"Vectorstore created in {creation_time:.2f}s")
+            logger.info(f"Vector store created in {creation_time:.2f}s")
             
             return vectorstore
             
         except Exception as e:
-            logger.error(f"Vectorstore creation error: {e}")
-            raise HTTPException(status_code=500, detail="Failed to create vectorstore")
+            logger.error(f"Vector store creation error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to create vector store")
 
     def process_document_questions(self, url: str, questions: List[str]) -> List[str]:
         """Process document and answer questions"""
@@ -340,30 +339,32 @@ Context: {context}"""),
             # Load and process document
             docs, chunks = self._load_and_process_document(url)
             
-            # Create vectorstore
-            vectorstore = self._create_vectorstore(url, chunks)
-            
-            # Create retriever
-            retriever = vectorstore.as_retriever(
-                search_type="similarity",
-                search_kwargs={"k": 5}
-            )
-            
-            # Build chain
-            rag_chain = self.build_chain(retriever)
+            # Create vector store
+            vectorstore = self._create_vectorstore(chunks)
             
             # Process questions in batch
             logger.info(f"Processing {len(questions)} questions in batch...")
             batch_query = " | ".join(questions)
             
+            # Get relevant context
+            relevant_docs = vectorstore.similarity_search(batch_query, k=5)
+            context = " ".join([doc.page_content for doc in relevant_docs])[:3000]
+            
+            # Create prompt
+            prompt = self.policy_prompt.format(query=batch_query, context=context)
+            
+            # Get response from LLM
             query_start_time = time.time()
-            batch_result = rag_chain.invoke({"query": batch_query})
+            batch_result = self.chat_model.invoke(prompt)
             query_time = time.time() - query_start_time
             
             logger.info(f"LLM query completed in {query_time:.2f}s")
             
             # Parse results
-            answers = [answer.strip() for answer in batch_result.split(" | ")]
+            if hasattr(batch_result, 'content'):
+                batch_result = batch_result.content
+            
+            answers = [answer.strip() for answer in str(batch_result).split(" | ")]
             
             # Validate answer count
             if len(answers) != len(questions):
